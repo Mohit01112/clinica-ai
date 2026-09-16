@@ -4,6 +4,8 @@
 
 The application uses **Retrieval-Augmented Generation (RAG)** to retrieve relevant information from uploaded reports and generate concise answers using **Groq**.
 
+live demo : [https://clinica-ai-ygxg8k9kwt9ptncpee2uez.streamlit.app/]
+
 ## ✨ Features
 
 - 📄 Upload medical PDF reports
