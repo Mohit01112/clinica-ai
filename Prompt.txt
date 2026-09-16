@@ -1,0 +1,46 @@
+Build a Streamlit medical chatbot that acts as a general practitioner (GP) over uploaded blood-test PDFs.
+
+PRODUCT
+- Screen 1: only a PDF uploader + “Upload and start chat”. No sidebar. No API-key fields. No cloud/region inputs.
+- On successful ingest, switch to Screen 2: a chat window.
+- Provide a button to go back and upload a different report.
+- After ingest the user chats with a GP that uses retrieved report chunks plus general GP knowledge.
+- Stay grounded in report values (test name, value, unit, range). Do not invent numbers.
+- Educational only, not a diagnosis.
+
+STACK
+- Streamlit UI
+- LLM: grok-4-latest via langchain_xai.ChatXAI
+- Embeddings: BAAI/bge-large-en-v1.5 (1024-d) via HuggingFaceEmbeddings
+- Vector DB: existing Pinecone index named medical-chatbot, cosine, 1024 dimensions
+- PDF: pypdf / PyPDFLoader
+- Chunking: RecursiveCharacterTextSplitter, chunk_size=800, overlap=150
+
+KEYS
+- Hardcode XAI_API_KEY and PINECONE_API_KEY as constants at the TOP of app.py, before any Pinecone or LangChain-Pinecone imports.
+- Also assign os.environ["PINECONE_API_KEY"] and os.environ["XAI_API_KEY"] from those constants.
+- Do not read keys from the Streamlit UI or from .env as the source of truth.
+
+PINECONE INGEST (critical)
+- On every new upload: delete ALL existing vectors in medical-chatbot (delete_all=True, including extra namespaces), then insert only the new PDF(s).
+- Do NOT use langchain_pinecone.PineconeVectorStore.from_documents or from_texts.
+  Those drop pinecone_api_key and raise:
+  “Pinecone API key must be provided in either pinecone_api_key or PINECONE_API_KEY environment variable”
+- Use the official Pinecone SDK only:
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    index = pc.Index("medical-chatbot")
+    index.delete(delete_all=True)
+    embed with HuggingFaceEmbeddings.embed_documents
+    index.upsert(vectors=[{id, values, metadata:{text, source, page}}])
+- Retrieve with embeddings.embed_query + index.query(vector=..., top_k=6, include_metadata=True).
+- Create the index only if it does not exist (dimension=1024, metric=cosine, serverless aws/us-east-1).
+
+CHAT
+- System prompt: experienced GP, quote labs from retrieved context, general GP advice around them, flag critical abnormalities, short disclaimer.
+- Pass last ~8 turns of history.
+- Model: ChatXAI(model="grok-4-latest", temperature=0.2, api_key=XAI_API_KEY)
+
+OUTPUT
+- Single file: app.py
+- requirements.txt with a consistent NumPy 2 stack plus torch, torchvision, fonttools, sentence-transformers, pinecone, langchain-xai, pypdf, streamlit.
+- No frontend key inputs. Upload first, chat second.

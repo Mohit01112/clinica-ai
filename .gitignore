@@ -1,0 +1,70 @@
+# ==============================
+# MediLens AI - Git Ignore
+# ==============================
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Uploaded medical reports / user data
+uploads/
+*.pdf
+
+# Local vector/database data
+data/
+vectorstore/
+chroma/
+*.db
+*.sqlite
+*.sqlite3
+
+# Machine learning / model files
+*.h5
+*.keras
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
