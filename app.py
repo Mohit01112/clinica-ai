@@ -1,11 +1,3 @@
-"""
-Medical GP Chatbot — Streamlit + Pinecone + ChatGroq (grok-4-latest)
-
-Bypasses langchain-pinecone VectorStore constructors (they ignore
-pinecone_api_key and require PINECONE_API_KEY at import time).
-Uses the official Pinecone SDK with the hardcoded key only.
-"""
-
 from __future__ import annotations
 
 import os
@@ -14,514 +6,914 @@ import time
 import uuid
 from typing import List
 
-# ---- keys first, before any Pinecone / LangChain Pinecone import ----
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-PINECONE_API_KEY = "pcsk_Ea2mF_9cW5X6Vu9w8xTEMAEy5A8y1SvdVqqjfnPoc7GrRtoGrn3KSY7ES7ELCuejintD9"
-PINECONE_CLOUD = "aws"
-PINECONE_REGION = "us-east-1"
-
-os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-os.environ["GROQ_API_KEY"] = GROQ_API_KEY
-
-INDEX_NAME = "medical-chatbot"
-EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
-EMBEDDING_DIM = 1024
-NAMESPACE = ""
-
 import streamlit as st
+from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_groq import ChatGroq
 from pinecone import Pinecone, ServerlessSpec
 
+
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
+
+# Loads local variables from .env during development.
+# In Streamlit Cloud, Render, Railway, etc., use the platform's secret manager.
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+
+PINECONE_CLOUD = os.getenv("PINECONE_CLOUD", "aws")
+PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east-1")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "medical-chatbot")
+PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
+
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+
+EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
+EMBEDDING_DIMENSION = 1024
+
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 150
+RETRIEVAL_TOP_K = 6
+UPSERT_BATCH_SIZE = 50
+MAX_CHAT_HISTORY_MESSAGES = 8
+
+
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
 GP_SYSTEM_PROMPT = """
+You are Clinica AI, an AI-powered medical report assistant.
 
-STRICT RESPONSE RULE
-============================================================
-
-Understand the user's question before answering.
-
-Answer ONLY what the user is asking.
-
-Do not automatically provide a complete analysis of the report.
-
-The amount of information in the answer must match the question.
-
-If the user asks for one value:
-→ Give that value and, if relevant, whether it is within the
-  reference range.
-
-If the user asks whether something is normal:
-→ Give a direct yes/no answer and briefly explain why.
-
-If the user asks what something means:
-→ Explain that specific result only.
-
-If the user asks why something is abnormal:
-→ Give a brief explanation of possible causes, without listing
-  unnecessary information.
-
-If the user asks about symptoms:
-→ Discuss only the report findings that could reasonably relate
-  to that symptom.
-
-If the user asks for a report summary:
-→ Then provide a concise overall summary.
-
-If the user asks "What about that?", "What does that mean?",
-or another ambiguous follow-up:
-→ Ask which result or topic they mean.
-
-NEVER add information simply because it exists in the report.
-
-NEVER automatically add:
-- all abnormal values
-- all normal values
-- tables
-- symptoms
-- causes
-- additional tests
-- treatments
-- lifestyle advice
-- emergency warnings
-- doctor recommendations
-
-unless they are directly relevant to the user's question.
-
-Keep the conversation natural and concise.
-You are Clinica AI, a medical report assistant.
-
-Your job is to answer the user's question using the uploaded medical
-report and relevant medical knowledge.
-
-IMPORTANT:
-Answer ONLY the question the user asked.
-
-Do NOT summarize the entire report unless the user specifically asks
-for a summary.
-
-Do NOT provide unrelated information.
-
-Keep answers concise and natural, like a helpful doctor explaining
-something to a patient.
+Your purpose is to help users understand their currently uploaded medical
+report in simple, clear, and patient-friendly language.
 
 ============================================================
-ANSWER LENGTH
+1. ACTIVE REPORT ONLY
 ============================================================
 
-Give a short, direct answer.
+- Use the ACTIVE REPORT CONTEXT provided below as the primary source for
+  all questions about the user's uploaded report.
+- Do not use information from previous reports, previous sessions, examples,
+  templates, or other users.
+- Every uploaded report may be different.
+- The report may be a blood test, urine test, imaging report, pathology
+  report, thyroid test, diabetes test, kidney test, liver test, lipid
+  profile, hormone test, prescription, discharge summary, or another
+  medical document.
+- Identify the actual report type and information from the provided
+  ACTIVE REPORT CONTEXT.
+- Never assume what a report contains based only on its type.
 
-Usually answer in 2–5 sentences.
+If the requested information cannot be found in the ACTIVE REPORT CONTEXT,
+respond:
 
-Only give more detail when the user's question requires it.
-
-Do not automatically add:
-- tables
-- complete report summaries
-- lists of all abnormal values
-- causes
-- symptoms
-- next steps
-- lifestyle advice
-- urgent-care advice
-- disclaimers
-
-unless they are directly relevant to the question.
-
-============================================================
-REPORT QUESTIONS
-============================================================
-
-Use the uploaded report when answering questions about it.
-
-Use the exact:
-- test name
-- result
-- unit
-- reference range
-
-when available.
-
-Never invent or change a result.
-
-If the requested information is not available in the report,
-clearly say that it cannot be verified from the report.
+"I couldn't find that information in the currently uploaded report."
 
 ============================================================
-EXAMPLES
+2. ANSWER ONLY WHAT THE USER ASKED
 ============================================================
 
-User:
-"Is my hemoglobin normal?"
+This is the most important rule.
 
-Good answer:
-"Your hemoglobin is 12.5 g/dL, which is slightly below the
-reference range of 13.0–17.0 g/dL shown in your report."
+Answer ONLY the user's current question.
 
-User:
-"Why is my hemoglobin low?"
+Do not automatically summarize the entire report.
 
-Good answer:
-"Your hemoglobin is slightly low at 12.5 g/dL. Common causes include
-iron deficiency, vitamin B12/folate deficiency, chronic disease, or
-blood loss."
+Do not automatically mention other test results.
 
-User:
-"What is my platelet count?"
+Do not provide additional medical advice unless it is directly relevant
+to the user's question.
 
-Good answer:
-"Your platelet count is 150,000/cumm, which is at the lower end of
-the reference range shown in your report."
+The answer should contain the minimum information necessary to completely
+answer the question.
 
-User:
-"Are my results normal?"
+Examples:
 
-Good answer:
-"Most of your reported CBC values are within the reference ranges,
-but your hemoglobin is slightly low and your PCV is high."
+User: "What is my calcium?"
+→ Give the calcium result, unit, and reference range if relevant.
 
-User:
+User: "Is my calcium normal?"
+→ Say whether it is within the report's reference range.
+
+User: "What does my calcium mean?"
+→ Explain the calcium result briefly.
+
+User: "What about my oxalate?"
+→ Answer about oxalate only.
+
+User: "What does my report say?"
+→ Give a concise overview of the report.
+
+============================================================
+3. RESPONSE LENGTH
+============================================================
+
+Match the response length to the user's question.
+
+Simple fact:
+→ 1 sentence.
+
+Normal/high/low question:
+→ 1–2 sentences.
+
+Explanation:
+→ 2–4 sentences.
+
+Detailed explanation:
+→ Provide more detail only when explicitly requested.
+
+Summary:
+→ Provide a concise summary of the important findings.
+
+Never make every answer unnecessarily long.
+
+============================================================
+4. REPORT VALUES
+============================================================
+
+When answering about a laboratory result, use the exact information
+provided in the report:
+
+- Test name
+- Result
+- Unit
+- Reference range
+- Flag such as High, Low, Borderline, Critical, Positive, Negative,
+  Detected, or Not Detected
+
+Never:
+
+- Invent a value.
+- Change a value.
+- Change the unit.
+- Estimate a missing value.
+- Create a reference range when the report provides none.
+- Treat a value as abnormal merely because it is close to the upper
+  or lower limit.
+
+Use:
+
+"within the reference range"
+
+"above the reference range"
+
+"below the reference range"
+
+when supported by the report.
+
+============================================================
+5. REPORT FACTS VS GENERAL MEDICAL INFORMATION
+============================================================
+
+Clearly distinguish between what the report shows and general medical
+knowledge.
+
+For report-specific questions:
+
+"The report shows..."
+
+"The report lists..."
+
+"The reported value is..."
+
+For general explanations:
+
+"Generally, ..."
+
+"Common causes can include..."
+
+"The report alone cannot determine the exact cause."
+
+Never turn a possible explanation into a confirmed diagnosis.
+
+Do not say:
+
+"You definitely have..."
+
+"This proves that you have..."
+
+"This confirms that you have..."
+
+"You are completely healthy."
+
+"Everything is fine."
+
+unless the report explicitly supports such wording.
+
+============================================================
+6. WHY QUESTIONS
+============================================================
+
+If the user asks:
+
+"Why is this high?"
+
+"Why is this low?"
+
+"Why is this abnormal?"
+
+First state what the report shows.
+
+Then briefly explain possible general reasons when appropriate.
+
+Do not claim that a particular cause applies to the user unless supported
+by the report.
+
+Example:
+
+"Your oxalate is 46 mg/day, which is within the reference range of
+16–49 mg/day shown in the report. It is near the upper end of the range,
+but the report alone cannot determine why."
+
+============================================================
+7. PRECAUTIONS AND NEXT STEPS
+============================================================
+
+If the user asks:
+
+"What precautions should I take?"
+
 "What should I do next?"
 
-Answer only with relevant next-step guidance based on the report.
-Do not give a complete report summary.
+Check whether the ACTIVE REPORT CONTEXT contains recommendations.
+
+If recommendations are present:
+→ Explain only the relevant recommendations from the report.
+
+If recommendations are not present:
+→ Say:
+
+"The report does not provide specific precautions or next steps."
+
+Do not automatically prescribe:
+
+- Medicines
+- Supplements
+- Dosages
+- Personalized treatment
+- Diet plans
+- Fluid targets
+- Lifestyle changes
+- Additional tests
+
+unless the user specifically asks for general medical information.
 
 ============================================================
-GENERAL MEDICAL QUESTIONS
+8. WHY THE DOCTOR ORDERED THE TEST
 ============================================================
 
-If the user asks a general medical question unrelated to the report,
-answer the question directly using general medical knowledge.
+If the user asks why a doctor ordered the test:
+
+- Explain what the test generally measures.
+- Do not claim to know the doctor's exact reason unless the report
+  explicitly states it.
+
+Example:
+
+"This test generally measures factors that can help assess kidney-stone
+risk. The report itself does not state the exact reason your doctor
+ordered it."
 
 ============================================================
-CONVERSATION
+9. FOLLOW-UP QUESTIONS
 ============================================================
 
-Use previous conversation messages when the user refers to something
-previously discussed.
+Use the recent conversation only to understand what the user means.
 
 For example:
-User: "What about that?"
-Use the previous conversation to understand what "that" refers to.
+
+User: "What about my oxalate?"
+Assistant: answers about oxalate.
+
+User: "Is that normal?"
+Assistant: understands that "that" refers to oxalate, provided the
+oxalate result is supported by ACTIVE REPORT CONTEXT.
+
+If the question is genuinely ambiguous, ask a short clarification.
+
+Example:
+
+"Which result would you like me to explain?"
+
+Do not guess.
 
 ============================================================
-LANGUAGE
+10. OVERALL REPORT QUESTIONS
 ============================================================
 
-Respond in the same language used by the user.
+If the user asks:
+
+"What does my report say?"
+
+"Can you explain my report?"
+
+"Is everything okay with my report?"
+
+"Are my results normal?"
+
+"Does anything look abnormal?"
+
+"Give me a summary."
+
+Provide a concise overview based ONLY on the ACTIVE REPORT CONTEXT.
+
+For laboratory reports, focus on:
+
+- Results outside the printed reference ranges
+- Important High/Low/Borderline/Critical flags
+- Positive/Negative or Detected/Not Detected results
+- Important comments or recommendations
+- Other results only when necessary to understand the overview
+
+Do not list every normal result unless the user asks for a complete
+summary.
+
+Do not make a broad conclusion about the user's overall health based
+on one report.
 
 ============================================================
-MEDICAL SAFETY
+11. MEDICAL SAFETY
 ============================================================
 
-Do not claim certainty about a diagnosis.
+You are an AI medical report assistant, not a doctor.
 
-Do not prescribe medication or personalized doses.
+- Do not diagnose diseases.
+- Do not prescribe medication.
+- Do not prescribe supplements or doses.
+- Do not create personalized treatment plans.
+- Do not make absolute claims about the user's health.
+- Do not claim certainty when the report does not provide certainty.
 
-If the user describes serious symptoms, recommend appropriate medical
-evaluation.
+If the user describes severe or potentially life-threatening symptoms,
+recommend seeking prompt evaluation from a qualified healthcare
+professional.
+
+Do not add emergency warnings when they are unrelated to the question.
 
 ============================================================
-REPORT CONTEXT
+12. GENERAL MEDICAL QUESTIONS
+============================================================
+
+If the user asks a general medical question unrelated to the uploaded
+report, answer using general medical information.
+
+Clearly distinguish general information from report-specific information.
+
+Example:
+
+"Generally, ..."
+
+"This is general medical information and is not a diagnosis."
+
+============================================================
+13. LANGUAGE AND STYLE
+============================================================
+
+- Respond in the same language used by the user.
+- Use simple, natural, patient-friendly language.
+- Avoid unnecessary medical jargon.
+- If a medical term is necessary, explain it briefly.
+- Sound conversational and helpful.
+- Do not sound robotic.
+- Do not unnecessarily repeat the user's question.
+
+============================================================
+14. DO NOT ADD UNREQUESTED INFORMATION
+============================================================
+
+Unless directly relevant to the user's question, do NOT automatically
+add:
+
+- Complete report summaries
+- All normal results
+- All abnormal results
+- Causes
+- Symptoms
+- Treatments
+- Medicines
+- Supplements
+- Diet advice
+- Lifestyle advice
+- Additional tests
+- Precautions
+- Emergency warnings
+- Doctor recommendations
+- Long disclaimers
+- Tables
+
+============================================================
+15. FINAL CHECK
+============================================================
+
+Before generating the answer, verify:
+
+1. What exactly did the user ask?
+2. Is the answer based on the ACTIVE REPORT CONTEXT?
+3. Did I use the exact value, unit, and reference range when available?
+4. Did I avoid information from another report or session?
+5. Did I avoid inventing missing information?
+6. Did I answer only the question asked?
+7. Did I keep the response as short as necessary?
+8. Did I avoid making a diagnosis?
+9. Did I avoid unrequested treatment or lifestyle advice?
+10. Did I preserve uncertainty where the report contains uncertainty?
+11. Is the response clear and natural?
+12. Did I respond in the user's language?
+
+============================================================
+ACTIVE REPORT CONTEXT
 ============================================================
 
 {context}
 """
 
-def require_keys() -> None:
-    if not PINECONE_API_KEY or PINECONE_API_KEY.startswith("PASTE_"):
-        raise ValueError("Replace PINECONE_API_KEY at the top of app.py with your real key.")
-    if not GROQ_API_KEY or GROQ_API_KEY.startswith("PASTE_"):
-        raise ValueError("Replace GROQ_API_KEY at the top of app.py with your real key.")
 
+# ============================================================
+# CONFIGURATION VALIDATION
+# ============================================================
+
+def require_keys() -> None:
+    missing = []
+
+    if not PINECONE_API_KEY:
+        missing.append("PINECONE_API_KEY")
+
+    if not GROQ_API_KEY:
+        missing.append("GROQ_API_KEY")
+
+    if missing:
+        missing_keys = ", ".join(missing)
+        raise ValueError(
+            f"Missing environment variable(s): {missing_keys}. "
+            "Add them to your local .env file or deployment secret manager."
+        )
+
+
+# ============================================================
+# EMBEDDINGS AND PINECONE
+# ============================================================
 
 @st.cache_resource(show_spinner=False)
 def get_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
 
+@st.cache_resource(show_spinner=False)
 def get_pinecone() -> Pinecone:
     require_keys()
     return Pinecone(api_key=PINECONE_API_KEY)
 
 
 def get_index():
-    pc = get_pinecone()
-    return pc.Index(INDEX_NAME)
+    return get_pinecone().Index(PINECONE_INDEX_NAME)
 
 
 def ensure_index(pc: Pinecone) -> None:
-    names = set()
-    for idx in pc.list_indexes():
-        if isinstance(idx, dict):
-            names.add(idx.get("name"))
+    index_names = set()
+
+    for index_info in pc.list_indexes():
+        if isinstance(index_info, dict):
+            index_names.add(index_info.get("name"))
         else:
-            names.add(getattr(idx, "name", None) or str(idx))
-    if INDEX_NAME in names:
+            index_names.add(getattr(index_info, "name", None) or str(index_info))
+
+    if PINECONE_INDEX_NAME in index_names:
         return
+
     pc.create_index(
-        name=INDEX_NAME,
-        dimension=EMBEDDING_DIM,
+        name=PINECONE_INDEX_NAME,
+        dimension=EMBEDDING_DIMENSION,
         metric="cosine",
-        spec=ServerlessSpec(cloud=PINECONE_CLOUD, region=PINECONE_REGION),
+        spec=ServerlessSpec(
+            cloud=PINECONE_CLOUD,
+            region=PINECONE_REGION,
+        ),
     )
+
     for _ in range(30):
-        desc = pc.describe_index(INDEX_NAME)
-        status = desc.get("status", {}) if isinstance(desc, dict) else getattr(desc, "status", {})
-        ready = status.get("ready") if isinstance(status, dict) else getattr(status, "ready", False)
-        if ready:
+        description = pc.describe_index(PINECONE_INDEX_NAME)
+
+        status = (
+            description.get("status", {})
+            if isinstance(description, dict)
+            else getattr(description, "status", {})
+        )
+
+        is_ready = (
+            status.get("ready", False)
+            if isinstance(status, dict)
+            else getattr(status, "ready", False)
+        )
+
+        if is_ready:
             return
+
         time.sleep(2)
-    raise RuntimeError(f"Timed out waiting for Pinecone index '{INDEX_NAME}' to be ready.")
+
+    raise RuntimeError(
+        f"Timed out waiting for Pinecone index '{PINECONE_INDEX_NAME}' to become ready."
+    )
 
 
 def delete_all_vectors(index) -> None:
+    """
+    Clears vectors from the current active-report session before indexing
+    the next uploaded report(s).
+    """
     try:
-        index.delete(delete_all=True)
-    except Exception:
-        pass
-    try:
-        stats = index.describe_index_stats()
-        namespaces = (
-            stats.get("namespaces", {})
-            if isinstance(stats, dict)
-            else getattr(stats, "namespaces", {}) or {}
-        )
-        for ns in namespaces:
-            try:
-                index.delete(delete_all=True, namespace=ns or None)
-            except Exception:
-                pass
-    except Exception:
-        pass
+        if PINECONE_NAMESPACE:
+            index.delete(delete_all=True, namespace=PINECONE_NAMESPACE)
+        else:
+            index.delete(delete_all=True)
+    except Exception as error:
+        raise RuntimeError(f"Could not clear old report data from Pinecone: {error}") from error
 
+
+# ============================================================
+# PDF EXTRACTION AND CHUNKING
+# ============================================================
 
 def load_pdfs(uploaded_files) -> List[Document]:
-    docs: List[Document] = []
-    for uf in uploaded_files:
-        suffix = os.path.splitext(uf.name)[1] or ".pdf"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uf.getvalue())
-            tmp_path = tmp.name
+    documents: List[Document] = []
+
+    for uploaded_file in uploaded_files:
+        suffix = os.path.splitext(uploaded_file.name)[1] or ".pdf"
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(uploaded_file.getvalue())
+            temp_path = temp_file.name
+
         try:
-            pages = PyPDFLoader(tmp_path).load()
-            for p in pages:
-                p.metadata = {
-                    **(p.metadata or {}),
-                    "source": uf.name,
-                    "filename": uf.name,
+            pages = PyPDFLoader(temp_path).load()
+
+            for page in pages:
+                page.metadata = {
+                    **(page.metadata or {}),
+                    "source": uploaded_file.name,
+                    "filename": uploaded_file.name,
                 }
-            docs.extend(pages)
+
+            documents.extend(pages)
+
         finally:
             try:
-                os.unlink(tmp_path)
+                os.unlink(temp_path)
             except OSError:
                 pass
-    return docs
+
+    return documents
 
 
-def split_docs(docs: List[Document]) -> List[Document]:
+def split_documents(documents: List[Document]) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=150,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", " ", ""],
     )
-    return splitter.split_documents(docs)
 
+    return splitter.split_documents(documents)
+
+
+# ============================================================
+# PINECONE INGESTION AND RETRIEVAL
+# ============================================================
 
 def upsert_chunks(index, chunks: List[Document]) -> int:
     embeddings = get_embeddings()
-    texts = [c.page_content for c in chunks]
-    vectors_data = embeddings.embed_documents(texts)
+
+    chunk_texts = [chunk.page_content for chunk in chunks]
+    vectors = embeddings.embed_documents(chunk_texts)
+
     payload = []
-    for i, (chunk, values) in enumerate(zip(chunks, vectors_data)):
+
+    for position, (chunk, vector) in enumerate(zip(chunks, vectors)):
+        source_name = (
+            chunk.metadata.get("filename")
+            or chunk.metadata.get("source")
+            or "uploaded-report"
+        )
+
         payload.append(
             {
-                "id": f"chunk-{i}-{uuid.uuid4().hex[:8]}",
-                "values": values,
+                "id": f"report-{uuid.uuid4().hex}-chunk-{position}",
+                "values": vector,
                 "metadata": {
+                    # Pinecone metadata has practical size limits.
                     "text": chunk.page_content[:3500],
-                    "source": chunk.metadata.get("filename")
-                    or chunk.metadata.get("source")
-                    or "report",
+                    "source": source_name,
                     "page": str(chunk.metadata.get("page", "")),
                 },
             }
         )
-    batch = 50
-    ns = NAMESPACE or None
-    for start in range(0, len(payload), batch):
-        if ns:
-            index.upsert(vectors=payload[start : start + batch], namespace=ns)
+
+    for start in range(0, len(payload), UPSERT_BATCH_SIZE):
+        batch = payload[start : start + UPSERT_BATCH_SIZE]
+
+        if PINECONE_NAMESPACE:
+            index.upsert(vectors=batch, namespace=PINECONE_NAMESPACE)
         else:
-            index.upsert(vectors=payload[start : start + batch])
+            index.upsert(vectors=batch)
+
     return len(payload)
 
 
 def ingest_reports(uploaded_files) -> int:
-    raw = load_pdfs(uploaded_files)
-    if not raw:
-        raise ValueError("Could not extract any text from the uploaded PDF(s).")
-    chunks = split_docs(raw)
-    if not chunks:
-        raise ValueError("PDF(s) produced no text chunks.")
+    raw_documents = load_pdfs(uploaded_files)
 
-    pc = get_pinecone()
-    ensure_index(pc)
-    index = pc.Index(INDEX_NAME)
+    if not raw_documents:
+        raise ValueError(
+            "No text could be extracted from the uploaded PDF(s). "
+            "The report may be scanned or image-only."
+        )
+
+    chunks = split_documents(raw_documents)
+
+    if not chunks:
+        raise ValueError("The uploaded PDF(s) did not produce usable text chunks.")
+
+    pinecone_client = get_pinecone()
+    ensure_index(pinecone_client)
+
+    index = pinecone_client.Index(PINECONE_INDEX_NAME)
+
+    # New upload = new active report session.
+    # Removes data from the previously uploaded report(s).
     delete_all_vectors(index)
+
     return upsert_chunks(index, chunks)
 
 
-def retrieve(question: str, k: int = 6) -> List[Document]:
+def retrieve(question: str, top_k: int = RETRIEVAL_TOP_K) -> List[Document]:
     embeddings = get_embeddings()
-    qvec = embeddings.embed_query(question)
-    index = get_index()
-    kwargs = {"vector": qvec, "top_k": k, "include_metadata": True}
-    if NAMESPACE:
-        kwargs["namespace"] = NAMESPACE
-    result = index.query(**kwargs)
-    matches = result.get("matches", []) if isinstance(result, dict) else getattr(result, "matches", []) or []
-    docs: List[Document] = []
-    for m in matches:
-        meta = m.get("metadata", {}) if isinstance(m, dict) else getattr(m, "metadata", {}) or {}
-        docs.append(
+    question_vector = embeddings.embed_query(question)
+
+    query_arguments = {
+        "vector": question_vector,
+        "top_k": top_k,
+        "include_metadata": True,
+    }
+
+    if PINECONE_NAMESPACE:
+        query_arguments["namespace"] = PINECONE_NAMESPACE
+
+    result = get_index().query(**query_arguments)
+
+    matches = (
+        result.get("matches", [])
+        if isinstance(result, dict)
+        else getattr(result, "matches", []) or []
+    )
+
+    documents: List[Document] = []
+
+    for match in matches:
+        metadata = (
+            match.get("metadata", {})
+            if isinstance(match, dict)
+            else getattr(match, "metadata", {}) or {}
+        )
+
+        text = metadata.get("text", "").strip()
+
+        if not text:
+            continue
+
+        documents.append(
             Document(
-                page_content=meta.get("text", ""),
+                page_content=text,
                 metadata={
-                    "filename": meta.get("source", "report"),
-                    "source": meta.get("source", "report"),
-                    "page": meta.get("page"),
+                    "filename": metadata.get("source", "uploaded-report"),
+                    "source": metadata.get("source", "uploaded-report"),
+                    "page": metadata.get("page", ""),
                 },
             )
         )
-    return docs
+
+    return documents
 
 
-def format_context(docs: List[Document]) -> str:
-    if not docs:
-        return "(No matching excerpts were retrieved from the uploaded reports.)"
-    parts = []
-    for i, d in enumerate(docs, 1):
-        src = d.metadata.get("filename") or d.metadata.get("source") or "report"
-        page = d.metadata.get("page")
-        header = f"[{i}] {src}" + (f" p.{page}" if page else "")
-        parts.append(f"{header}\n{d.page_content.strip()}")
-    return "\n\n---\n\n".join(parts)
+def format_context(documents: List[Document]) -> str:
+    if not documents:
+        return "(No relevant excerpts were found in the currently uploaded report.)"
+
+    context_parts = []
+
+    for number, document in enumerate(documents, start=1):
+        source = (
+            document.metadata.get("filename")
+            or document.metadata.get("source")
+            or "uploaded-report"
+        )
+
+        page = document.metadata.get("page", "")
+        heading = f"[Excerpt {number} | File: {source}"
+
+        if page:
+            heading += f" | Page: {page}"
+
+        heading += "]"
+
+        context_parts.append(f"{heading}\n{document.page_content.strip()}")
+
+    return "\n\n---\n\n".join(context_parts)
 
 
+# ============================================================
+# GROQ RESPONSE GENERATION
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
 def build_llm() -> ChatGroq:
     require_keys()
-    return ChatGroq(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), temperature=0.2, api_key=GROQ_API_KEY)
+
+    return ChatGroq(
+        model=GROQ_MODEL,
+        temperature=0.2,
+        api_key=GROQ_API_KEY,
+    )
 
 
-def answer_as_gp(question: str, history: list) -> str:
-    retrieved = retrieve(question)
-    system = GP_SYSTEM_PROMPT.format(context=format_context(retrieved))
-    messages = [SystemMessage(content=system)]
-    for msg in history[-8:]:
-        if msg["role"] == "user":
-            messages.append(HumanMessage(content=msg["content"]))
-        elif msg["role"] == "assistant":
-            messages.append(AIMessage(content=msg["content"]))
-    messages.append(HumanMessage(content=question))
-    content = build_llm().invoke(messages).content
+def extract_text_from_llm_content(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+
     if isinstance(content, list):
-        bits = []
+        text_parts = []
+
         for block in content:
             if isinstance(block, str):
-                bits.append(block)
+                text_parts.append(block)
             elif isinstance(block, dict) and "text" in block:
-                bits.append(block["text"])
-        content = "".join(bits)
+                text_parts.append(str(block["text"]))
+
+        return "".join(text_parts).strip()
+
     return str(content).strip()
 
 
-def init_state() -> None:
-    for k, v in {
+def answer_as_clinica_ai(question: str, history: list) -> str:
+    retrieved_documents = retrieve(question)
+    report_context = format_context(retrieved_documents)
+
+    system_prompt = GP_SYSTEM_PROMPT.format(context=report_context)
+
+    messages = [SystemMessage(content=system_prompt)]
+
+    # Conversation helps interpret follow-ups, but report facts must still
+    # come from the active report context included in the system prompt.
+    for message in history[-MAX_CHAT_HISTORY_MESSAGES:]:
+        if message["role"] == "user":
+            messages.append(HumanMessage(content=message["content"]))
+        elif message["role"] == "assistant":
+            messages.append(AIMessage(content=message["content"]))
+
+    messages.append(HumanMessage(content=question))
+
+    response = build_llm().invoke(messages)
+
+    return extract_text_from_llm_content(response.content)
+
+
+# ============================================================
+# STREAMLIT UI
+# ============================================================
+
+def initialize_session_state() -> None:
+    defaults = {
         "messages": [],
         "ready": False,
         "last_files": [],
         "chunk_count": 0,
         "error": "",
-    }.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
-def render_upload() -> None:
-    st.title("Clinica AI – Medical Report Assistant 🩺")
-    st.write("Upload one or more test PDFs. and get answers to your questions about your results.")
-    uploaded = st.file_uploader(
-        "Upload medical report (PDF)",
+def reset_active_report_session() -> None:
+    st.session_state.ready = False
+    st.session_state.messages = []
+    st.session_state.last_files = []
+    st.session_state.chunk_count = 0
+    st.session_state.error = ""
+
+
+def render_upload_screen() -> None:
+    st.title("Clinica AI — Medical Report Assistant 🩺")
+    st.write(
+        "Upload one or more medical-report PDFs, then ask questions about the "
+        "currently uploaded report."
+    )
+
+    uploaded_files = st.file_uploader(
+        "Upload medical report PDFs",
         type=["pdf"],
         accept_multiple_files=True,
         label_visibility="collapsed",
     )
-    start = st.button("Upload and start chat", type="primary", disabled=not uploaded)
 
     if st.session_state.error:
         st.error(st.session_state.error)
 
-    if start:
-        with st.spinner("Reading reports, resetting Pinecone, and building embeddings..."):
-            try:
-                n = ingest_reports(uploaded)
-                st.session_state.ready = True
-                st.session_state.chunk_count = n
-                st.session_state.last_files = [f.name for f in uploaded]
-                st.session_state.messages = []
-                st.session_state.error = ""
-            except Exception as e:
-                st.session_state.ready = False
-                st.session_state.error = f"Ingest failed: {e}"
-        st.rerun()
+    start_chat = st.button(
+        "Upload and start chat",
+        type="primary",
+        disabled=not uploaded_files,
+    )
 
-
-def render_chat() -> None:
-    top_l, top_r = st.columns([3, 1])
-    with top_l:
-        st.title("What Would You Like to Know?")
-        names = ", ".join(st.session_state.last_files) or "your reports"
-        st.caption(f"Active reports: {names} · {st.session_state.chunk_count} chunks in `{INDEX_NAME}`")
-    with top_r:
-        if st.button("Upload a different report"):
-            st.session_state.ready = False
-            st.session_state.messages = []
-            st.session_state.error = ""
-            st.rerun()
-
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    prompt = st.chat_input("Ask about your results...")
-    if not prompt:
+    if not start_chat:
         return
 
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.spinner("Reading reports and preparing the chat..."):
+        try:
+            chunk_count = ingest_reports(uploaded_files)
+
+            st.session_state.ready = True
+            st.session_state.chunk_count = chunk_count
+            st.session_state.last_files = [
+                uploaded_file.name for uploaded_file in uploaded_files
+            ]
+            st.session_state.messages = []
+            st.session_state.error = ""
+
+        except Exception as error:
+            st.session_state.ready = False
+            st.session_state.error = f"Could not process the report: {error}"
+
+    st.rerun()
+
+
+def render_chat_screen() -> None:
+    left_column, right_column = st.columns([3, 1])
+
+    with left_column:
+        st.title("What would you like to know?")
+        active_files = ", ".join(st.session_state.last_files) or "your report"
+        st.caption(
+            f"Active report session: {active_files} · "
+            f"{st.session_state.chunk_count} indexed sections"
+        )
+
+    with right_column:
+        if st.button("Upload new report"):
+            reset_active_report_session()
+            st.rerun()
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    question = st.chat_input("Ask about your report...")
+
+    if not question:
+        return
+
+    st.session_state.messages.append(
+        {"role": "user", "content": question}
+    )
+
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(question)
+
     with st.chat_message("assistant"):
-        with st.spinner("Reviewing your reports..."):
+        with st.spinner("Reviewing the active report..."):
             try:
-                reply = answer_as_gp(prompt, st.session_state.messages[:-1])
-            except Exception as e:
-                reply = f"I could not complete that request: {e}"
-            st.markdown(reply)
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+                answer = answer_as_clinica_ai(
+                    question=question,
+                    history=st.session_state.messages[:-1],
+                )
+            except Exception as error:
+                answer = f"I could not complete that request: {error}"
+
+            st.markdown(answer)
+
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer}
+    )
 
 
 def main() -> None:
-    st.set_page_config(page_title="GP Blood-Test Chatbot", page_icon="🩺", layout="centered")
-    init_state()
+    st.set_page_config(
+        page_title="Clinica AI",
+        page_icon="🩺",
+        layout="centered",
+    )
+
+    initialize_session_state()
+
     if st.session_state.ready:
-        render_chat()
+        render_chat_screen()
     else:
-        render_upload()
+        render_upload_screen()
 
 
 if __name__ == "__main__":
